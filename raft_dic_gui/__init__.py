@@ -6,4 +6,5 @@ Exposes processing and model helpers used by the Tkinter app.
 """
 
 from . import model, processing  # re-export for convenience
+from .api import RAFTcorr  # noqa: F401 — public API
 
