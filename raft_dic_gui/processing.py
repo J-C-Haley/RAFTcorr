@@ -169,7 +169,9 @@ def dic_over_roi_with_tiling(ref_img: np.ndarray,
                              use_smooth: bool = True,
                              sigma: float = 2.0,
                              iters: int = 12,
-                             tile_callback: Optional[Callable] = None):
+                             tile_callback: Optional[Callable] = None,
+                             return_convergence: bool = False,
+                             convergence_last_n: int = 3):
     """
     Perform DIC over the ROI using an adaptive tiling strategy with weighted fusion.
 
@@ -198,12 +200,16 @@ def dic_over_roi_with_tiling(ref_img: np.ndarray,
     max_retries = 1
     retry_count = 0
     current_p_max = p_max_pixels
+    extras = {}
 
     while True:
         try:
             # 2. Prepare Accumulators
             accum = np.zeros((hC, wC, 2), dtype=np.float64)
             wsum = np.zeros((hC, wC), dtype=np.float64)
+            if return_convergence:
+                conv_accum = np.zeros((hC, wC), dtype=np.float64)
+                conv_wsum = np.zeros((hC, wC), dtype=np.float64)
 
             # 3. Determine Tiling Strategy
             max_T = int(np.sqrt(current_p_max))
@@ -244,8 +250,15 @@ def dic_over_roi_with_tiling(ref_img: np.ndarray,
                 def_tile = def_img[y0:y1, x0:x1, :]
 
                 t0 = time.time()
-                _, flow_up = inference(model, ref_tile, def_tile, device, test_mode=True, iters=iters)
-                flow_up = flow_up.squeeze(0)
+                if return_convergence:
+                    flow_iters = inference(model, ref_tile, def_tile, device, test_mode=False, iters=iters)
+                    flow_up = flow_iters[-1].squeeze(0)
+                    n_use = min(convergence_last_n, len(flow_iters))
+                    last_n = torch.stack(flow_iters[-n_use:], dim=0)  # (n, 1, 2, th, tw)
+                    conv_std_tile = last_n.std(dim=0).norm(dim=1).squeeze(0).cpu().numpy()
+                else:
+                    _, flow_up = inference(model, ref_tile, def_tile, device, test_mode=True, iters=iters)
+                    flow_up = flow_up.squeeze(0)
                 inference_time += (time.time() - t0)
 
                 u = flow_up[0].cpu().numpy()
@@ -265,6 +278,9 @@ def dic_over_roi_with_tiling(ref_img: np.ndarray,
                 weight = window_cache[k]
                 accum[sy:sy+th, sx:sx+tw, :] += flow * weight[..., None]
                 wsum[sy:sy+th, sx:sx+tw] += weight
+                if return_convergence:
+                    conv_accum[sy:sy+th, sx:sx+tw] += conv_std_tile * weight
+                    conv_wsum[sy:sy+th, sx:sx+tw] += weight
 
             # Success — exit retry loop
             break
@@ -294,6 +310,14 @@ def dic_over_roi_with_tiling(ref_img: np.ndarray,
     invalid_mask = ~roiC.astype(bool)
     result_C[invalid_mask] = np.nan
 
+    if return_convergence:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            conv_C = np.where(conv_wsum > 0, conv_accum / conv_wsum, np.nan)
+        conv_C[invalid_mask] = np.nan
+        conv_full = np.full((H, W), np.nan, dtype=np.float32)
+        conv_full[yC:yC+hC, xC:xC+wC] = conv_C
+        extras["convergence"] = conv_full
+
     if use_smooth:
         result_C = smooth_displacement_field(result_C, sigma=sigma)
 
@@ -309,7 +333,7 @@ def dic_over_roi_with_tiling(ref_img: np.ndarray,
         _emit_status(f"RAFT inference percentage: {(inference_time/total_time*100):.1f}%")
         _emit_status(f"Other operations time: {(total_time-inference_time):.2f} seconds")
 
-    return disp_full, (xC, yC, wC, hC)
+    return disp_full, (xC, yC, wC, hC), extras
 
 
 def save_displacement_results(displacement_field: np.ndarray, output_dir: str, index: int,

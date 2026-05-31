@@ -623,6 +623,10 @@ def inference(model, frame1, frame2, device: str, pad_mode: str = 'sintel',
                 if is_full_res:
                     flow_iters = [-f for f in flow_iters]
 
+                # Crop padding from every iteration (same as test_mode=True path).
+                h, w = original_size
+                flow_iters = [f[:, :, :h, :w] for f in flow_iters]
+
                 return flow_iters
 
 

@@ -6,6 +6,24 @@ Public Python API for RAFTcorr — programmatic inference without the GUI.
     model = RAFTcorr.from_checkpoint("models/active/RAFTcorr_large_v1.pth")
     uv = model.predict(ref_img, def_img)               # (H, W, 2) float32
     uvs = model.run_sequence([img0, img1, img2, ...])  # list of (H, W, 2)
+
+Confidence filtering
+--------------------
+Two filters are enabled by default and mask low-confidence pixels to NaN:
+
+- Photometric (threshold=10.0): warps the deformed image by the predicted UV
+  and measures per-pixel mean-RGB L1 error vs the reference.  Pixels where
+  the warp error exceeds the threshold are rejected.  Catches: bad texture,
+  out-of-plane motion, lighting gradients, crack faces.
+
+- Convergence (threshold=0.5 px): runs RAFT with all iterations visible and
+  measures the per-pixel std of the last `convergence_last_n` flow estimates.
+  High std means RAFT never settled on a stable answer there.  Catches:
+  featureless regions, periodic patterns, large-displacement failures.
+
+Disable either filter by passing its threshold as None:
+    model = RAFTcorr.auto(photometric_threshold=None)   # photometric off
+    model = RAFTcorr.auto(convergence_threshold=None)   # convergence off
 """
 
 from __future__ import annotations
@@ -14,6 +32,8 @@ import os
 from typing import Callable, List, Optional, Sequence, Union
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 from .config import (
     DEFAULT_CONTEXT_PADDING,
@@ -51,27 +71,91 @@ def _load_frame(frame: Frame) -> np.ndarray:
     return np.ascontiguousarray(img)
 
 
+def _photometric_error(
+    ref_arr: np.ndarray, def_arr: np.ndarray, uv: np.ndarray
+) -> np.ndarray:
+    """
+    Warp def_arr by uv and return per-pixel mean-RGB L1 error vs ref_arr.
+
+    Returns (H, W) float32.  Pixels where uv is NaN are sampled at their
+    original position (unwarped), so outside-ROI areas are evaluated against
+    identity — they will show non-zero error and get masked anyway since uv
+    is already NaN there.
+    """
+    H, W = uv.shape[:2]
+
+    u = torch.from_numpy(np.nan_to_num(uv[..., 0], nan=0.0)).float()
+    v = torch.from_numpy(np.nan_to_num(uv[..., 1], nan=0.0)).float()
+
+    ys = torch.arange(H, dtype=torch.float32)
+    xs = torch.arange(W, dtype=torch.float32)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+
+    # Normalize sampling coordinates to [-1, 1] for F.grid_sample
+    norm_x = (grid_x + u) * 2.0 / max(W - 1, 1) - 1.0
+    norm_y = (grid_y + v) * 2.0 / max(H - 1, 1) - 1.0
+    grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(0)  # (1, H, W, 2)
+
+    def_t = torch.from_numpy(def_arr).permute(2, 0, 1).float().unsqueeze(0)  # (1, 3, H, W)
+    warped = F.grid_sample(
+        def_t, grid, mode="bilinear", align_corners=True, padding_mode="border"
+    )
+    warped_np = warped.squeeze(0).permute(1, 2, 0).numpy()  # (H, W, 3)
+
+    return np.mean(np.abs(ref_arr.astype(np.float32) - warped_np), axis=-1).astype(
+        np.float32
+    )
+
+
+def _apply_filters(
+    uv: np.ndarray,
+    ref_arr: np.ndarray,
+    def_arr: np.ndarray,
+    extras: dict,
+    photometric_threshold: Optional[float],
+    convergence_threshold: Optional[float],
+) -> np.ndarray:
+    """Apply enabled confidence filters in-place; returns uv for convenience."""
+    if photometric_threshold is not None:
+        error = _photometric_error(ref_arr, def_arr, uv)
+        with np.errstate(invalid="ignore"):
+            uv[~(error <= photometric_threshold)] = np.nan
+
+    if convergence_threshold is not None and "convergence" in extras:
+        conv_map = extras["convergence"]
+        with np.errstate(invalid="ignore"):
+            uv[~(conv_map <= convergence_threshold)] = np.nan
+
+    return uv
+
+
 class RAFTcorr:
     """
     Minimal programmatic interface to RAFTcorr inference.
 
     Handles model loading, automatic tile-size selection, tiling, weighted
-    fusion, and optional smoothing.  No GUI, no Flask server, no disk I/O
-    beyond reading images.
+    fusion, optional smoothing, and per-pixel confidence filtering.
+    No GUI, no Flask server, no disk I/O beyond reading images.
 
     Usage
     -----
-    # Load a specific checkpoint:
     model = RAFTcorr.from_checkpoint("models/active/RAFTcorr_large_v1.pth")
+    model = RAFTcorr.auto()  # auto-discover from models/active/
 
-    # Or auto-discover from models/active/:
-    model = RAFTcorr.auto()
+    uv = model.predict(ref_img, def_img)         # (H, W, 2) float32, NaN = masked
+    uvs = model.run_sequence(frame_paths)        # list of (H, W, 2)
 
-    # Single pair → (H, W, 2) float32, NaN outside ROI:
-    uv = model.predict(ref_img, def_img)
-
-    # Image sequence, all relative to frames[0]:
-    uvs = model.run_sequence(frame_paths, progress=print)
+    Confidence thresholds
+    ---------------------
+    photometric_threshold : float | None
+        Max allowed mean-RGB warp error (0–255 scale).  Default 10.0.
+        None disables the filter.
+    convergence_threshold : float | None
+        Max allowed per-pixel flow std across last `convergence_last_n`
+        RAFT iterations, in pixels.  Default 0.5.
+        None disables the filter (also skips the extra inference work).
+    convergence_last_n : int
+        How many tail iterations to use for convergence std.  Default 3.
     """
 
     def __init__(
@@ -85,6 +169,9 @@ class RAFTcorr:
         iters: int = DEFAULT_ITERATIONS,
         use_smooth: bool = True,
         sigma: float = 2.0,
+        photometric_threshold: Optional[float] = 10.0,
+        convergence_threshold: Optional[float] = 0.5,
+        convergence_last_n: int = 3,
     ) -> None:
         self._model = model
         self._metadata = metadata
@@ -94,6 +181,9 @@ class RAFTcorr:
         self.iters = iters
         self.use_smooth = use_smooth
         self.sigma = sigma
+        self.photometric_threshold = photometric_threshold
+        self.convergence_threshold = convergence_threshold
+        self.convergence_last_n = convergence_last_n
         # Auto-size tiles from available VRAM if not overridden.
         self.p_max_pixels = (
             p_max_pixels
@@ -114,7 +204,6 @@ class RAFTcorr:
     ) -> "RAFTcorr":
         """Load a specific checkpoint by path."""
         if device is None:
-            import torch
             device = "cuda" if torch.cuda.is_available() else "cpu"
         model_path = str(model_path)
         metadata = describe_checkpoint(model_path)
@@ -166,15 +255,15 @@ class RAFTcorr:
         Returns
         -------
         (H, W, 2) float32 array.  [..., 0] = U (horizontal displacement),
-        [..., 1] = V (vertical displacement).  NaN outside the ROI.
+        [..., 1] = V (vertical displacement).  NaN = outside ROI or masked
+        by an enabled confidence filter.
         """
         ref_arr = _load_frame(ref)
         def_arr = _load_frame(deformed)
-
         H, W = ref_arr.shape[:2]
         mask = _full_mask(H, W) if roi_mask is None else _coerce_mask(roi_mask)
 
-        disp_full, _ = dic_over_roi_with_tiling(
+        disp_full, _, extras = dic_over_roi_with_tiling(
             ref_arr,
             def_arr,
             mask,
@@ -187,8 +276,16 @@ class RAFTcorr:
             sigma=self.sigma,
             iters=self.iters,
             tile_callback=tile_callback,
+            return_convergence=(self.convergence_threshold is not None),
+            convergence_last_n=self.convergence_last_n,
         )
-        return disp_full.astype(np.float32)
+
+        uv = disp_full.astype(np.float32)
+        return _apply_filters(
+            uv, ref_arr, def_arr, extras,
+            self.photometric_threshold,
+            self.convergence_threshold,
+        )
 
     # ------------------------------------------------------------------
     # Sequence inference (accumulative mode)
@@ -220,6 +317,7 @@ class RAFTcorr:
         Returns
         -------
         List of (N-1) displacement arrays, each (H, W, 2) float32.
+        NaN = outside ROI or masked by an enabled confidence filter.
 
         # TODO(incremental): Add `mode="incremental"`, `key_frames: list[int]`,
         # and `key_frame_interval: int` parameters.
@@ -242,12 +340,13 @@ class RAFTcorr:
         ref_arr = _load_frame(frames[0])
         H, W = ref_arr.shape[:2]
         mask = _full_mask(H, W) if roi_mask is None else _coerce_mask(roi_mask)
+        want_convergence = self.convergence_threshold is not None
 
         total = len(frames) - 1
         results: List[np.ndarray] = []
         for i, frame in enumerate(frames[1:]):
             def_arr = _load_frame(frame)
-            disp_full, _ = dic_over_roi_with_tiling(
+            disp_full, _, extras = dic_over_roi_with_tiling(
                 ref_arr,
                 def_arr,
                 mask,
@@ -259,8 +358,16 @@ class RAFTcorr:
                 use_smooth=self.use_smooth,
                 sigma=self.sigma,
                 iters=self.iters,
+                return_convergence=want_convergence,
+                convergence_last_n=self.convergence_last_n,
             )
-            results.append(disp_full.astype(np.float32))
+            uv = disp_full.astype(np.float32)
+            _apply_filters(
+                uv, ref_arr, def_arr, extras,
+                self.photometric_threshold,
+                self.convergence_threshold,
+            )
+            results.append(uv)
             if progress is not None:
                 progress(i + 1, total)
 
@@ -271,10 +378,17 @@ class RAFTcorr:
     # ------------------------------------------------------------------
 
     def __repr__(self) -> str:
+        filters = []
+        if self.photometric_threshold is not None:
+            filters.append(f"phot<{self.photometric_threshold}")
+        if self.convergence_threshold is not None:
+            filters.append(f"conv<{self.convergence_threshold}px")
+        filter_str = ", ".join(filters) if filters else "no filters"
         return (
             f"RAFTcorr(model={self._metadata.label!r}, "
             f"device={self.device!r}, "
-            f"p_max_pixels={self.p_max_pixels})"
+            f"p_max_pixels={self.p_max_pixels}, "
+            f"{filter_str})"
         )
 
 

@@ -251,7 +251,7 @@ class DICProcessor:
                 self._extra_progress["tile_current"] = tile_idx + 1
                 self._extra_progress["tile_total"] = tile_total
 
-            disp_full, _ = proc.dic_over_roi_with_tiling(
+            disp_full, _, _ = proc.dic_over_roi_with_tiling(
                 ref_image,
                 def_image,
                 current_mask,
