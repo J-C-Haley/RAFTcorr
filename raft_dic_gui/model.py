@@ -446,6 +446,27 @@ def discover_models(models_dir: Optional[str] = None,
         candidates.append(ModelEntry(path=str(path), label=label))
 
     candidates.sort(key=lambda entry: entry.label.lower(), reverse=True)
+
+    # Explicit default: models/active/DEFAULT (one checkpoint filename per line,
+    # '#' comments allowed) or the RAFTCORR_DEFAULT_MODEL env var moves that entry
+    # to the front, so RAFTcorr.auto() is deterministic instead of relying on the
+    # reverse-alphabetical sort above.
+    wanted = os.environ.get('RAFTCORR_DEFAULT_MODEL', '').strip()
+    default_file = root / 'DEFAULT'
+    if not wanted and default_file.is_file():
+        try:
+            wanted = next((ln.strip() for ln in default_file.read_text().splitlines()
+                           if ln.strip() and not ln.strip().startswith('#')), '')
+        except OSError:
+            wanted = ''
+    if wanted:
+        for i, entry in enumerate(candidates):
+            if Path(entry.path).name == wanted or entry.label == wanted:
+                candidates.insert(0, candidates.pop(i))
+                break
+        else:
+            print(f"Warning: default model '{wanted}' (from DEFAULT file or "
+                  f"RAFTCORR_DEFAULT_MODEL) not found under {root}; using sorted order.")
     return candidates
 
 

@@ -218,10 +218,11 @@ class RAFTcorr:
         **kwargs,
     ) -> "RAFTcorr":
         """
-        Auto-discover and load the first checkpoint from models/active/.
+        Auto-discover and load the default checkpoint from models/active/.
 
-        discover_models() returns entries sorted reverse-alphabetically, so a
-        naming convention like RAFTcorr_large_v2 takes priority over v1.
+        The default is the checkpoint named in models/active/DEFAULT (or the
+        RAFTCORR_DEFAULT_MODEL env var).  Without either, discover_models()
+        falls back to reverse-alphabetical order.
         """
         entries = discover_models(str(models_dir) if models_dir else None)
         if not entries:
